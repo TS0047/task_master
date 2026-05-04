@@ -1,5 +1,6 @@
 from json import tool
 import json
+import pprint
 
 from langgraph.graph import StateGraph,START,END
 from langchain_core.messages import SystemMessage,ChatMessage,ToolMessage
@@ -94,7 +95,8 @@ graph.add_edge("add","check")
 graph.add_edge("check","router")
 
 app = graph.compile()
+user_input = input("Enter your goal: ")
+lol = app.invoke({"goal": user_input, "steps": []})
 
-lol = app.invoke({"goal": "baking a choclate cake", "steps": []})
-
-print(lol)
+pprint.pp(lol)
+    
