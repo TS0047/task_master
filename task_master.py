@@ -31,10 +31,13 @@ def add_steps(state : AIstate)-> AIstate:
     """plans how to reach goal by adding steps one at a time"""
     sysmess = (
     f"You are a planner. Goal: {state['goal']}\n"
-    f"Steps confirmed so far: {state['steps']}\n"
-    "The chat history contains feedback from the checker if any step was rejected.\n"
-    "If the checker suggested a 'next' step, use that as your next suggestion.\n"
-    "Return only the next single step in one line. Never return an empty response."
+    f"Steps confirmed so far: {state['steps']}\n\n"
+    "Your job: output ONLY the next single step as a plain sentence.\n"
+    "Rules:\n"
+    "- Never output empty text\n"
+    "- Never repeat a confirmed step\n"
+    "- If the last message in chat history is a rejection with a suggestion, use that suggestion as your output\n"
+    "- One line only, no numbering, no preamble"
 )
     print()
     result = step_ai.invoke([SystemMessage(content = sysmess)]+state["chat"]).content
@@ -73,9 +76,7 @@ def check_step(state:AIstate)->AIstate:
     elif result["answer"] == "stop":
         state["steps"] = state["steps"] + ["END"]
         print("checker : goal achieved, stopping")
-
-    if (len(state["chat"]) > 4):
-        state["chat"] = state["chat"][-4:]
+            
     return state
     
 def router(state:AIstate)->str:
