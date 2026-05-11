@@ -1,107 +1,195 @@
-from json import tool
 import json
 import pprint
-
-from langgraph.graph import StateGraph,START,END
-from langchain_core.messages import SystemMessage,AIMessage,ToolMessage 
+from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import SystemMessage
 from langchain_ollama import ChatOllama
-from typing import TypedDict
+from typing import TypedDict, Optional
 
+# ── models ────────────────────────────────────────────────────────────────────
 
-step_ai = ChatOllama(model="qwen2.5:7b",temperature=0)
-repeat_schema ={
+step_ai  = ChatOllama(model="qwen2.5:7b", temperature=0)
+
+plan_schema = {
     "type": "object",
-    "properties" : {
-    "answer": {"type": "string", "enum": ["update", "repeat", "stop"]},
-    "reason": {"type": "string"},
-    "next" : {"type": "string"}
+    "properties": {
+        "milestones": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Ordered high-level phases the plan must pass through"
+        },
+        "done_when": {
+            "type": "string",
+            "description": "Precise, observable condition that marks the goal as fully complete"
+        },
+        "max_steps": {
+            "type": "integer",
+            "description": "Rough upper bound on total steps expected"
+        }
     },
-    "required": ["answer","reason","next"]
+    "required": ["milestones", "done_when", "max_steps"]
 }
-check_ai = ChatOllama(model="qwen2.5:7b",format=repeat_schema,temperature=0)
+
+check_schema = {
+    "type": "object",
+    "properties": {
+        "answer": {"type": "string", "enum": ["update", "repeat", "stop"]},
+        "reason": {"type": "string"},
+        "next":   {"type": "string"},
+    },
+    "required": ["answer", "reason", "next"],
+}
+
+plan_ai  = ChatOllama(model="qwen2.5:7b", format=plan_schema,  temperature=0)
+check_ai = ChatOllama(model="qwen2.5:7b", format=check_schema, temperature=0)
+
+
+# ── state ─────────────────────────────────────────────────────────────────────
 
 class AIstate(TypedDict):
-    goal : str
-    steps : list[str]
-    chat : list[AIMessage]
+    goal:            str
+    milestones:      list[str]   # set once by plan_agent
+    done_when:       str         # set once by plan_agent
+    max_steps:       int         # set once by plan_agent
+    steps:           list[str]
+    last_suggestion: str
+    last_rejection:  Optional[str]
+    done:            bool
 
 
-    
-def add_steps(state : AIstate)-> AIstate:
-    """plans how to reach goal by adding steps one at a time"""
+# ── nodes ─────────────────────────────────────────────────────────────────────
+
+def plan_agent(state: AIstate) -> AIstate:
+    """Runs once. Defines milestones, completion criteria, and step budget."""
     sysmess = (
-    f"You are a planner. Goal: {state['goal']}\n"
-    f"Steps confirmed so far: {state['steps']}\n\n"
-    "Your job: output ONLY the next single step as a plain sentence.\n"
-    "Rules:\n"
-    "- Never output empty text\n"
-    "- Never repeat a confirmed step\n"
-    "- If the last message in chat history is a rejection with a suggestion, use that suggestion as your output\n"
-    "- One line only, no numbering, no preamble"
-)
-    print()
-    result = step_ai.invoke([SystemMessage(content = sysmess)]+state["chat"]).content
-    state["chat"] = state["chat"] + [AIMessage(content=result,name="step_ai")]
-    print(f"step_ai : i suggest [{result}] as the next step")
-    return state
+        f"Goal: {state['goal']}\n\n"
+        "You are a planning assistant. Analyse the goal and output:\n"
+        "  - milestones: ordered list of high-level phases needed\n"
+        "  - done_when: a precise, observable sentence describing when the goal is 100%% complete\n"
+        "  - max_steps: realistic upper bound on the number of atomic steps required\n"
+        "Be specific. 'done_when' must be unambiguous — a checklist-style condition."
+    )
+    result = json.loads(plan_ai.invoke([SystemMessage(content=sysmess)]).content)
 
-def check_step(state:AIstate)->AIstate:
-    """checks whether the steps are correct and updates the state accordingly"""
+    print("\n=== Plan ===")
+    print(f"Milestones : {result['milestones']}")
+    print(f"Done when  : {result['done_when']}")
+    print(f"Max steps  : {result['max_steps']}\n")
+
+    return {
+        **state,
+        "milestones": result["milestones"],
+        "done_when":  result["done_when"],
+        "max_steps":  result["max_steps"],
+    }
+
+
+def add_steps(state: AIstate) -> AIstate:
+    steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(state["steps"])) or "None yet."
+
+    prompt = (
+        f"Goal: {state['goal']}\n"
+        f"Plan milestones: {state['milestones']}\n"
+        f"Goal is complete when: {state['done_when']}\n\n"
+        f"Confirmed steps so far:\n{steps_text}\n\n"
+    )
+    if state["last_rejection"]:
+        prompt += f"Your last suggestion was rejected. Feedback: {state['last_rejection']}\n\n"
+
+    prompt += (
+        "Output ONLY the single next atomic step not yet in the confirmed list.\n"
+        "Rules:\n"
+        "- Never output empty text\n"
+        "- Never repeat or rephrase a confirmed step\n"
+        "- One sentence, no numbering, no preamble\n"
+        "- If all milestones are covered by confirmed steps, output: DONE"
+    )
+
+    suggestion = step_ai.invoke([SystemMessage(content=prompt)]).content.strip()
+
+    if not suggestion:
+        suggestion = f"Review progress toward: {state['goal']}"
+
+    print(f"\nstep_ai  : [{suggestion}]")
+    return {**state, "last_suggestion": suggestion, "last_rejection": None}
+
+
+def check_step(state: AIstate) -> AIstate:
+    steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(state["steps"])) or "None yet."
+
+    # Hard cap: force stop if over budget
+    if len(state["steps"]) >= state["max_steps"] or state["last_suggestion"] == "DONE":
+        print("checker  : ✓ step budget reached / planner signalled DONE — stopping")
+        return {**state, "done": True}
+
     sysmess = (
         f"Goal: {state['goal']}\n"
-        f"All steps so far: {state['steps']}\n\n"
-        "Evaluate the LAST step only in context of the full plan:\n"
-        "- 'update' if the last step is a valid, non-redundant step toward the goal\n"
-        "- 'repeat' if the last step is wrong, redundant, or contradicts previous steps\n"
-        "- 'stop' if ALL steps together FULLY complete the goal\n\n"
-        "IMPORTANT: A single step does NOT need to complete the goal alone. "
-        "It just needs to be a valid next step in the plan."
-        "Respond in JSON format with 'answer' as one of 'update', 'repeat', or 'stop', and provide a brief 'reason' for your decision. If 'repeat', also suggest a 'next' step to replace the incorrect one."
-    ) 
-    result =  json.loads(check_ai.invoke([SystemMessage(content = sysmess)]+state["chat"]).content) 
-    print()
-    if result["answer"] == "update":
-        print("checker : step is correct, keep going")
-        state["steps"] = state["steps"] + [state["chat"][-1].content]
+        f"Goal is complete when: {state['done_when']}\n\n"
+        f"Confirmed steps so far:\n{steps_text}\n\n"
+        f"Proposed next step: \"{state['last_suggestion']}\"\n\n"
+        "Evaluate this proposed step:\n"
+        "  'update' → valid, non-redundant, moves plan forward\n"
+        "  'repeat' → redundant, already covered by a confirmed step, or contradicts the plan\n"
+        "  'stop'   → confirmed steps + this step satisfy the done_when condition exactly\n\n"
+        "Key rule for 'repeat': if any confirmed step already covers the same action "
+        "(even with different wording), answer 'repeat'.\n"
+        "Return JSON with 'answer', 'reason', and 'next' (replacement if repeating)."
+    )
 
+    result = json.loads(check_ai.invoke([SystemMessage(content=sysmess)]).content)
+    answer = result["answer"]
 
-    elif result["answer"] == "repeat":
-        state["chat"] = state["chat"] + [AIMessage( 
-        content="Rejected: " + result["reason"] + ". Try instead: " + result["next"],
-        name="check_ai"
-    )]
-        print("checker : step is wrong, removing it and giving reason : "+result["reason"]+"\n and suggesting next step : "+result["next"])  
+    if answer == "update":
+        print(f"checker  : ✓ accepted  — {result['reason']}")
+        return {**state, "steps": state["steps"] + [state["last_suggestion"]]}
 
+    elif answer == "repeat":
+        feedback = f"Rejected (redundant): {result['reason']}. Try instead: {result['next']}"
+        print(f"checker  : ✗ rejected  — {result['reason']}")
+        print(f"           → suggestion: {result['next']}")
+        return {**state, "last_rejection": feedback}
 
-    elif result["answer"] == "stop":
-        state["steps"] = state["steps"] + ["END"]
-        print("checker : goal achieved, stopping")
-            
+    elif answer == "stop":
+        print(f"checker  : ✓ goal complete — {result['reason']}")
+        return {**state, "steps": state["steps"] + [state["last_suggestion"]], "done": True}
+
     return state
-    
-def router(state:AIstate)->str:
-    """decides whether to add more steps or check the current steps"""
-    if len(state["steps"]) == 0:
-        return "add"
-    if state["steps"][-1] == "END":
-        return "end"
-    return "add"
+
+
+# ── routing ───────────────────────────────────────────────────────────────────
+
+def router(state: AIstate) -> str:
+    return "end" if state.get("done") else "add"
+
+
+# ── graph ─────────────────────────────────────────────────────────────────────
 
 graph = StateGraph(AIstate)
-
-graph.add_node("add", add_steps)
+graph.add_node("plan",  plan_agent)
+graph.add_node("add",   add_steps)
 graph.add_node("check", check_step)
-graph.add_node("router", lambda state:state)
 
-
-graph.add_edge(START,"router")
-graph.add_conditional_edges("router",router,{"add":"add","end":END})
-graph.add_edge("add","check")
-graph.add_edge("check","router")
+graph.add_edge(START, "plan")
+graph.add_edge("plan", "add")
+graph.add_edge("add",  "check")
+graph.add_conditional_edges("check", router, {"add": "add", "end": END})
 
 app = graph.compile()
-user_input = input("Enter your goal: ")
-lol = app.invoke({"goal": user_input, "steps": [],"chat":[]})
 
-pprint.pp(lol)
-    
+# ── run ───────────────────────────────────────────────────────────────────────
+
+user_input = input("Enter your goal: ")
+result = app.invoke({
+    "goal":            user_input,
+    "milestones":      [],
+    "done_when":       "",
+    "max_steps":       20,
+    "steps":           [],
+    "last_suggestion": "",
+    "last_rejection":  None,
+    "done":            False,
+})
+
+print("\n=== Final Plan ===")
+for i, step in enumerate(result["steps"], 1):
+    print(f"  {i}. {step}")
+print(f"\nDone when: {result['done_when']}")
